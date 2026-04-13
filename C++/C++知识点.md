@@ -2161,3 +2161,225 @@ class RedisDatabase  : public IDatabase { ... };
 | DIP | 依赖抽象不依赖实现 | 模块间耦合过紧 |
 
 > SOLID 不是金科玉律，小型项目过度应用反而增加复杂度。核心是**在合适的时机，用合适的原则降低耦合、提高可维护性**。
+
+## 19 为什么要用size_t
+
+`size_t` 是 C/C++ 中用于表示**对象大小或数组索引**的无符号整数类型。之所以广泛使用它，主要有以下原因：
+
+### 1. 保证足够大的范围
+
+- `size_t` 的大小由平台决定（通常是 `sizeof(size_t) == sizeof(void*)`），能够容纳理论上最大可能的对象尺寸。例如在 64 位系统上，`size_t` 通常为 64 位无符号整数，可以表示最大 `2^64-1` 字节，而 `int` 通常只有 32 位，无法表示超过 2GB 的对象。
+- 标准库函数（如 `malloc`、`strlen`、`vector::size()`）均使用 `size_t` 作为长度或计数的类型，保证跨平台兼容性。
+
+### 2. 语义清晰：表示“大小”或“计数”
+
+- `size_t` 的名字直接表明它用于存储**大小**（size），让代码自文档化。使用 `int` 可能会让读者困惑：它是表示大小还是普通整数？是否可能为负？
+- 无符号特性强调大小不可能为负数，避免不必要的符号检查。
+
+### 3. 避免符号不匹配警告
+
+- 如果混用有符号整数（如 `int`）和 `size_t`（如 `vector::size()` 的返回值），编译器会产生有符号/无符号不匹配的警告。使用 `size_t` 接收标准库的返回值可以消除这些警告。
+
+### 4. 性能优化
+
+- 某些平台对无符号整数的运算可能比有符号整数更快（尽管差异微小）。更重要的是，使用与机器字长匹配的类型（如 `size_t`）可以减少符号扩展指令，提高访问效率。
+
+### 5. 防止负数错误
+
+- 索引或大小本不应为负。如果错误地传入负数给 `size_t` 参数，会自动转换为一个极大的正数（如 `-1` 转为 `SIZE_MAX`），往往导致程序崩溃或逻辑错误，从而**快速暴露 bug**，而不是静默地产生错误行为。
+
+### 常见使用场景
+
+cpp
+
+```
+// 1. 数组索引
+for (size_t i = 0; i < array.size(); ++i) { ... }
+
+// 2. 内存大小
+size_t size = sizeof(MyClass);
+void* p = malloc(size);
+
+// 3. 字符串长度
+size_t len = strlen("hello");
+
+// 4. 容器大小
+std::vector<int> v(100);
+size_t s = v.size();   // size() 返回 size_t
+```
+
+
+
+### 注意事项
+
+- 当 `size_t` 与有符号整数混合运算时，需小心**隐式转换**带来的意外（如 `-1 > 0u` 为真）。
+
+- 当需要表示**可能为负的差值**（如指针相减）时，应使用 `ptrdiff_t`（有符号版本）。
+
+- 循环递减时使用 `size_t` 要格外小心，因为 `size_t` 永远 `>= 0`，可能导致无限循环：
+
+  cpp
+
+  ```
+  for (size_t i = 10; i >= 0; --i)   // 错误！i 永远不小于 0
+  ```
+
+  
+
+总之，`size_t` 是为表示大小/计数而设计的正确类型，使用它能提高代码的可移植性、清晰度和安全性。
+
+## 20 设计生产者-消费者模型
+
+使用多线程实现生产者和消费者。 使用缓冲区进行数据传递。 需要同步生产者和消费者，避免数据丢失和重复消费。 要求： 使用适当的同步机制（如互斥锁、条件变量等）确保线程安全。 使用代码展示生产者和消费者的工作流程。
+
+### 1 代码
+
+```c++
+// 有界缓冲区类
+class BoundedBuffer {
+public:
+    explicit BoundedBuffer(size_t capacity) : capacity_(capacity), done_(false) {}
+
+    // 生产者：向缓冲区添加数据（阻塞直到有空位）
+    void produce(int value) {
+        std::unique_lock<std::mutex> lock(mtx_);
+        // 等待缓冲区未满
+        not_full_.wait(lock, [this] { return buffer_.size() < capacity_ || done_; });
+        if (done_) return;  // 如果已经结束，不再生产（可选，实际中通常生产者先结束）
+        buffer_.push(value);
+        std::cout << "Produced: " << value << ", buffer size: " << buffer_.size() << '\n';
+        not_empty_.notify_one();
+    }
+
+    // 消费者：从缓冲区取出数据（阻塞直到有数据或生产结束）
+    std::optional<int> consume() {
+        std::unique_lock<std::mutex> lock(mtx_);
+        // 等待缓冲区非空或生产结束
+        not_empty_.wait(lock, [this] { return !buffer_.empty() || done_; });
+        if (buffer_.empty() && done_) {
+            return std::nullopt;  // 无更多数据，消费者可退出
+        }
+        int value = buffer_.front();
+        buffer_.pop();
+        std::cout << "Consumed: " << value << ", buffer size: " << buffer_.size() << '\n';
+        not_full_.notify_one();
+        return value;
+    }
+
+    // 通知所有消费者生产已结束（由主线程或最后一个生产者调用）
+    void set_done() {
+        {
+            std::lock_guard<std::mutex> lock(mtx_);
+            done_ = true;
+        }
+        not_empty_.notify_all();
+        not_full_.notify_all();
+    }
+
+private:
+    std::queue<int> buffer_;
+    const size_t capacity_;
+    bool done_;
+    std::mutex mtx_;
+    std::condition_variable not_full_;
+    std::condition_variable not_empty_;
+};
+
+// 生产者线程函数
+void producer_task(BoundedBuffer& buffer, int start, int end) {
+    for (int i = start; i <= end; ++i) {
+        buffer.produce(i);
+        // 模拟生产耗时
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+}
+
+// 消费者线程函数
+void consumer_task(BoundedBuffer& buffer, int id) {
+    while (true) {
+        auto val = buffer.consume();
+        if (!val.has_value()) {
+            std::cout << "Consumer " << id << " exiting (no more data).\n";
+            break;
+        }
+        // 模拟消费耗时
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+}
+
+int main() {
+    constexpr size_t BUFFER_CAPACITY = 5;
+    constexpr int PRODUCE_COUNT = 20;   // 生产 1..20
+
+    BoundedBuffer buffer(BUFFER_CAPACITY);
+
+    // 创建生产者和消费者线程（可多个，这里各一个）
+    std::thread producer(producer_task, std::ref(buffer), 1, PRODUCE_COUNT);
+    std::thread consumer(consumer_task, std::ref(buffer), 1);
+
+    // 等待生产者完成
+    producer.join();
+    // 通知消费者生产已结束
+    buffer.set_done();
+    // 等待消费者退出
+    consumer.join();
+
+    std::cout << "All threads finished.\n";
+    return 0;
+}
+```
+
+### 2 伪代码
+
+```
+// 共享资源
+缓冲区: 队列（固定容量 N）
+互斥锁: mutex
+条件变量: not_empty（表示缓冲区非空）
+条件变量: not_full（表示缓冲区未满）
+结束标志: done（初始 false）
+
+// 生产者线程（可多个）
+procedure producer():
+    while 有数据需要生产:
+        item = 生产一个数据
+        mutex.lock()
+        while 缓冲区.size() == N and not done:
+            not_full.wait(mutex)   // 等待缓冲区有空位
+        if done:
+            mutex.unlock()
+            break
+        缓冲区.push(item)
+        print("生产了", item, "缓冲区大小", 缓冲区.size())
+        not_empty.signal()         // 通知消费者
+        mutex.unlock()
+    // 所有数据生产完毕
+    mutex.lock()
+    done = true
+    not_empty.broadcast()          // 唤醒所有消费者
+    mutex.unlock()
+
+// 消费者线程（可多个）
+procedure consumer():
+    while true:
+        mutex.lock()
+        while 缓冲区.empty() and not done:
+            not_empty.wait(mutex)  // 等待数据或结束
+        if 缓冲区.empty() and done:
+            mutex.unlock()
+            break                  // 没有更多数据，退出
+        item = 缓冲区.pop()
+        print("消费了", item, "缓冲区大小", 缓冲区.size())
+        not_full.signal()          // 通知生产者有空位
+        mutex.unlock()
+        处理(item)                  // 模拟消费耗时
+
+// 主线程
+主():
+    创建 M 个生产者线程
+    创建 N 个消费者线程
+    等待所有生产者线程结束
+    // 生产者已设置 done，消费者会自动退出
+    等待所有消费者线程结束
+```
+

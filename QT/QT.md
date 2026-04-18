@@ -191,3 +191,111 @@ void MyClass::oneTimeSlot() {
 | 一次性响应                    | **需要**（在槽内断开）   |
 
 **记住：** Qt 的自动断开机制已经覆盖了绝大多数情况，你只需在特殊逻辑需求下手动断开。滥用 `disconnect` 不会造成错误，但会增加不必要的代码。
+
+## 3 Q_ASSERT怎么用
+
+`Q_ASSERT` 是 Qt 提供的断言宏，用于在**调试模式**下检查程序中的不变条件。如果断言的条件为 `false`，程序会输出一条包含文件、行号、断言表达式的错误信息，然后**立即终止**（调用 `qFatal()`）。在**发布模式**（未定义 `QT_NO_DEBUG`）下，`Q_ASSERT` 会被预处理移除，不产生任何额外开销。
+
+### 基本用法
+
+cpp
+
+```
+#include <QtGlobal>   // 或 <QDebug>，其中包含了 Q_ASSERT
+
+void myFunction(int* ptr) {
+    Q_ASSERT(ptr != nullptr);  // 如果 ptr 为 nullptr，程序会崩溃并输出错误
+    // 后续安全使用 ptr...
+}
+```
+
+
+
+**失败时的输出示例**（输出到 stderr 或调试器）：
+
+text
+
+```
+ASSERT: "ptr != nullptr" in file myfile.cpp, line 5
+```
+
+
+
+### 相关宏
+
+| 宏                                 | 说明                                                         |
+| :--------------------------------- | :----------------------------------------------------------- |
+| `Q_ASSERT(cond)`                   | 如果 `cond` 为 false，则断言失败。                           |
+| `Q_ASSERT_X(cond, where, message)` | 提供更多信息：`where` 通常是函数名，`message` 是额外的描述文本。 |
+| `Q_ASSUME(cond)`                   | 提示编译器 `cond` 始终为 true（用于优化），不产生运行时检查。 |
+
+**示例**：
+
+cpp
+
+```
+Q_ASSERT_X(index >= 0 && index < size(), "MyClass::getItem", "Index out of range");
+```
+
+
+
+### 重要行为说明
+
+1. **仅在调试模式下生效**
+   默认情况下，`Q_ASSERT` 只有在 `QT_NO_DEBUG` **未**定义时才有效。在典型的 `qmake` 或 CMake 项目中：
+
+   - **Debug 构建**：断言启用。
+   - **Release 构建**：断言被移除（不生成任何代码）。
+
+   如果你希望在 Release 模式下也保留断言，可以在项目配置中定义 `QT_FORCE_ASSERTS`。
+
+2. **断言失败会终止程序**
+   `Q_ASSERT` 失败时会调用 `qFatal()`，导致程序立即退出（类似于 `std::abort()`）。它**不是**用于处理可恢复的错误（如用户输入无效），而是用于捕获“不可能发生”的编程错误。
+
+3. **表达式不会被求值**（在 Release 模式下）
+   因为 Release 模式下宏展开为空，所以不要在断言里放有副作用的表达式：
+
+   cpp
+
+   ```
+   Q_ASSERT(++counter > 0);  // 危险：Release 模式下 ++counter 不会执行！
+   ```
+
+   
+
+4. **自定义断言处理**
+   你可以通过安装 `qInstallMessageHandler()` 来捕获所有 Qt 消息（包括断言），从而将断言输出重定向到日志文件或自定义对话框。
+
+### 对比标准 `assert`
+
+| 特性          | `Q_ASSERT`                         | `assert` (标准C)             |
+| :------------ | :--------------------------------- | :--------------------------- |
+| 头文件        | `<QtGlobal>`                       | `<cassert>`                  |
+| 调试/发布控制 | 通过 `QT_NO_DEBUG`                 | 通过 `NDEBUG`                |
+| 失败输出格式  | 包含 Qt 风格的上下文信息           | 简单文本                     |
+| 可扩展性      | 可与 `qInstallMessageHandler` 集成 | 通常需要替换 `__assert` 函数 |
+
+### 推荐使用场景
+
+- **前置条件检查**：函数参数的有效性（如指针非空、索引在范围内）。
+- **后置条件检查**：函数返回后某些状态应当成立。
+- **不变量检查**：在算法中间验证某些逻辑永远不会出错。
+
+**正确示例**：
+
+cpp
+
+```
+void updateRecord(int id, const QString& data) {
+    Q_ASSERT(id > 0);
+    Q_ASSERT(!data.isEmpty());
+    // 业务逻辑...
+}
+```
+
+
+
+### 注意事项
+
+- 不要在断言中编写任何程序必须依赖的代码（如资源分配、状态修改），因为 Release 模式下它们会被删除。
+- 对于需要在 Release 模式下也进行校验的条件（如安全关键代码），请使用普通的 `if` + `qFatal()` 或抛出异常。
